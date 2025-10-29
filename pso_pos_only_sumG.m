@@ -1,0 +1,238 @@
+function [C_best, sumG_best, hist] = pso_pos_only_sumG(CHNK,varargin)
+% Position-only optimizer (a,b,phi fixed from CHNK.ell).
+% Objective: minimize sum(G_ij), with diag(G)=R(xi,xi),
+% offdiag G(xi,xj) = -(1/(2*pi))log|xi-xj| + R(xi,xj).
+
+% ---------- accept optional leading cellNo ----------
+if ~isempty(varargin) && isnumeric(varargin{1}) && isscalar(varargin{1})
+    varargin = varargin(2:end);
+end
+
+% ---------- opts ----------
+p = inputParser;
+p.addParameter('UseN',      []);
+p.addParameter('SwarmSize', 30);
+p.addParameter('MaxIters',  50);
+p.addParameter('PenaltyW',  1e3);
+p.addParameter('Plot',      false);
+% >>> NEW: Excel logging <<<
+p.addParameter('ExcelFile',  'Cbest_progress.xlsx');
+p.addParameter('ExcelSheet', 'progress');
+p.addParameter('LogIters',   [1 40*50]);   % [start end] (inclusive)
+p.addParameter('LogEvery', 50);
+p.parse(varargin{:});
+opt  = p.Results;
+Wpen = opt.PenaltyW;
+
+projRoot = pwd;
+addpath(fullfile(projRoot,'chunkie'),'-begin');
+run(fullfile(projRoot,'chunkie','startup.m'));
+assert(exist('chunkerfunc','file')>0 && exist('chunkerfuncuni','file')>0 ...
+    && exist('chunkermat','file')>0, 'chunkIE not on path');
+% -------------------- load data (no simplification) --------------------
+S = load('fly_muscle_data.mat');
+need = {'edgeX','edgeY','NucX','NucY','NucMajor','NucMinor','NucAngle','startPoints','endPoints'};
+for k=1:numel(need), assert(isfield(S,need{k}), 'Missing "%s"', need{k}); end
+
+E   = CHNK.ell;
+Nall= numel(E.cx);
+N   = Nall;
+if ~isempty(opt.UseN), N = min(Nall,opt.UseN); end
+
+a   = E.a(1:N).';  b = E.b(1:N).';  phi = E.phi(1:N).';
+C0  = [E.cx(:) E.cy(:)];
+C0  = C0(1:N,:);
+
+% ---------- bounds (inset polygon bbox) ----------
+minx = min(CHNK.polyX); maxx = max(CHNK.polyX);
+miny = min(CHNK.polyY); maxy = max(CHNK.polyY);
+padx = 0.03*(maxx-minx + eps);  pady = 0.03*(maxy-miny + eps);
+LBv  = repmat([minx+padx, miny+pady], 1, N);
+UBv  = repmat([maxx-padx, maxy-pady], 1, N);
+
+% ---------- history ----------
+hist.best     = +inf(opt.MaxIters,1);
+hist.feasible = false(opt.MaxIters,1);
+iter_counter  = 0; best_seen = +inf; C_best = C0;
+
+% ---------- helper: scalar R and G without grads/Hessians ----------
+    function [Rvec, Gvec] = RG_scalar(T, xi)
+        if isvector(T), T = T(:).'; end
+        chnkr= CHNK.chnkr; area = CHNK.area;
+        Sk   = kernel('laplace','s');
+        [~,i0]  = min( (E.cx(:)-xi(1)).^2 + (E.cy(:)-xi(2)).^2 );
+        sig     = CHNK.sig_list{i0};
+        wts     = chnkr.wts(:);
+        wbar    = sum(sig .* wts);
+        x = T(:,1); y = T(:,2);
+        targ = struct('r',[x.'; y.']);
+        Ssig  = chunkerkerneval(chnkr, Sk, sig, targ);
+        Rvec  = Ssig + (x.^2 + y.^2)/(4*area) + wbar;
+        DX = x - xi(1);  DY = y - xi(2);
+        r2 = DX.^2 + DY.^2;
+        Gvec  = Rvec - (1/(2*pi))*log( max(sqrt(r2), eps) );
+        tol2 = (1e-12 * max(sqrt(area),1))^2;
+        self = r2 <= tol2;
+        if any(self), Gvec(self) = Rvec(self); end
+    end
+
+% ---------- objective: sum of G with diag=R ----------
+    function [f,meta] = obj_sumG(C)
+        feas = true; pen = 0;
+        inP = inpolygon(C(:,1),C(:,2),CHNK.polyX,CHNK.polyY);
+        if any(~inP), feas=false; pen=pen+sum(~inP); end
+        M = 24; th = linspace(0,2*pi,M+1); th(end)=[];
+        for k=1:N
+            ct = cos(phi(k)); st = sin(phi(k));
+            XY = [a(k)*cos(th); b(k)*sin(th)];
+            xy = [ct -st; st ct]*XY;
+            xb = C(k,1)+xy(1,:); yb = C(k,2)+xy(2,:);
+            ok = inpolygon(xb,yb,CHNK.polyX,CHNK.polyY);
+            bad = sum(~ok);
+            if bad>0, feas=false; pen=pen+bad; end
+        end
+        for i=1:N-1
+            for j=i+1:N
+                dij = hypot(C(i,1)-C(j,1), C(i,2)-C(j,2));
+                rmin = 0.5*((a(i)+a(j)) + (b(i)+b(j)))/2;
+                if dij < rmin, feas=false; pen=pen+(rmin-dij); end
+            end
+        end
+        Gmat = zeros(N,N);
+        for j=1:N
+            xi = C(j,:);
+            [~,Gj] = RG_scalar(C, xi);
+            Gmat(:,j) = Gj(:);
+        end
+        for i=1:N
+            [Ri,~] = RG_scalar(C(i,:), C(i,:));
+            Gmat(i,i) = Ri(1);
+        end
+        val = sum(Gmat(:));
+        f   = val + Wpen*pen;
+        meta = struct('feasible',feas,'pen',pen,'val',val);
+    end
+
+% ---------- Excel logging helper (robust to Excel being busy) ----------
+    function write_progress(k, best_val, Cbest)
+        it0 = opt.LogIters(1); it1 = opt.LogIters(end);
+        if k < it0 || k > it1, return; end
+        row = k - it0 + 2;     % row 2..(len+1): row 1 is header
+        fn  = opt.ExcelFile;   sh = opt.ExcelSheet;
+
+        % Header (once)
+        if k == it0
+            hdr = ["iter","sumG_best"];
+            xyhdr = strings(1, 2*N);
+            for t=1:N, xyhdr(2*t-1:2*t) = ["x"+t, "y"+t]; end
+            header = [hdr, xyhdr];
+            try
+                writematrix(header, fn, 'Sheet', sh, 'Range', 'A1');
+            catch, end
+        end
+
+        % Data row
+        rowdata = [k, best_val, reshape(Cbest.',1,[])];
+        % Retry a couple times if Excel is locked
+        ok = false; tries = 0;
+        while ~ok && tries < 3
+            try
+                writematrix(rowdata, fn, 'Sheet', sh, 'Range', ['A' num2str(row)]);
+                ok = true;
+            catch
+                tries = tries + 1;
+                pause(0.25);
+            end
+        end
+    end
+
+    function f = wrapper(psx)
+        C = reshape(psx,2,[]).';
+        [f,meta] = obj_sumG(C);
+        iter_counter = iter_counter + 1; %#ok<NASGU>
+        if f < best_seen, best_seen = f; C_best = C; end
+        k = min(iter_counter, numel(hist.best));
+        hist.best(k)     = best_seen;
+        hist.feasible(k) = meta.feasible;
+
+        % >>> NEW: write progress to Excel for the requested iter range
+        write_progress(k, best_seen, C_best);
+
+        if opt.Plot && mod(k,10)==0
+            clf; hold on; axis equal;
+            plot([CHNK.polyX CHNK.polyX(1)],[CHNK.polyY CHNK.polyY(1)],'k-','LineWidth',1.1);
+            for t=1:N
+                th = linspace(0,2*pi,200);
+                ct = cos(phi(t)); st = sin(phi(t));
+                XY = [a(t)*cos(th); b(t)*sin(th)];
+                xy = [ct -st; st ct]*XY;
+                plot(C_best(t,1)+xy(1,:), C_best(t,2)+xy(2,:), 'r-');
+            end
+            title(sprintf('iter %d | best sum(G)=%.6g', k, best_seen));
+            drawnow;
+        end
+    end
+
+% ---------- run PSO ----------
+x0 = C0(:).'; nvar = numel(x0);
+if exist('particleswarm','file')==2
+    opts = optimoptions('particleswarm','SwarmSize',opt.SwarmSize, ...
+        'MaxIterations',opt.MaxIters,'Display','iter','UseParallel',false);
+    particleswarm(@wrapper, nvar, LBv, UBv, opts);
+else
+    S  = opt.SwarmSize;
+    W  = 0.72; c1 = 1.5; c2 = 1.5;
+    X  = repmat(x0,S,1) + 0.2*(randn(S,nvar).*repmat(UBv-LBv,S,1));
+    X  = max(min(X,UBv),LBv);
+    V  = zeros(S,nvar);
+    pX = X; pF = inf(S,1); gX = pX(1,:); gF = inf;
+    for it=1:opt.MaxIters
+        for s=1:S
+            f = wrapper(X(s,:));
+            if f < pF(s), pF(s)=f; pX(s,:)=X(s,:); end
+        end
+        [~, gi] = min(pF); gX = pX(gi,:);
+        r1 = rand(S,nvar); r2 = rand(S,nvar);
+        V  = W*V + c1*r1.*(pX - X) + c2*r2.*(repmat(gX,S,1)-X);
+        X  = max(min(X + V, UBv), LBv);
+    end
+end
+
+sumG_best = best_seen;
+
+% trim hist
+last = find(isfinite(hist.best)&hist.best~=0,1,'last');
+if ~isempty(last)
+    hist.best     = hist.best(1:last);
+    hist.feasible = hist.feasible(1:last);
+end
+end
+
+% ======== greens helpers (unchanged) ========
+function [G,GradG,HessG] = green_data(T, xi, ~)
+if isvector(T), T = T(:).'; end
+Nt    = size(T,1);
+CHNK  = CHNK_get();
+chnkr = CHNK.chnkr; area = CHNK.area;
+Sk    = kernel('laplace','s');
+[~,i0] = min( (CHNK.ell.cx(:)-xi(1)).^2 + (CHNK.ell.cy(:)-xi(2)).^2 );
+sig    = CHNK.sig_list{i0};
+wts    = chnkr.wts(:);
+wbar   = sum(sig .* wts);
+x = T(:,1); y = T(:,2);
+targ = struct('r',[x.'; y.']);
+Ssig = chunkerkerneval(chnkr, Sk, sig, targ);
+R    = Ssig + (x.^2 + y.^2)/(4*area) + wbar;
+DX = x - xi(1);  DY = y - xi(2);
+r2 = DX.^2 + DY.^2;
+G = R - (1/(2*pi))*log( max(sqrt(r2), eps) );
+tol2 = (1e-12 * max(sqrt(area),1))^2;
+self = r2 <= tol2;
+if any(self), G(self) = R(self); end
+GradG = []; HessG = [];
+end
+
+function [R,GradR,HessR] = green_regular_only(x, y, ~)
+[G,~,~] = green_data(x, y, []);
+R = G;  GradR = []; HessR = [];
+end
