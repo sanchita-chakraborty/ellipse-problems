@@ -192,7 +192,7 @@ function f = wrapper(psx)
     bb  = v(N+1:2*N);
     pph = v(2*N+1:3*N);
 
-    % ===== robustness clamps (PSO already bounds, but be safe) =====
+    % ===== robustness clamps =====
     aa = max(aa, 1e-9);
     bb = max(bb, 1e-9);
 
@@ -202,48 +202,78 @@ function f = wrapper(psx)
     % ===== 2) penalties =====
     pwr = max(1, opt.PropPNorm);
 
-    % -- 2a) boundary clearance: (max(a,b)+margin) <= center-clearance --
+    % ---- boundary clearance: (max(a,b)+margin) <= center-clearance ----
     clr_center = local_clearance_to_polygon(C0, CH.polyX, CH.polyY);  % N×1
     need_gap   = max(aa, bb) + opt.BndMargin;
     penBnd     = sum( max(0, (need_gap - clr_center)/L0 ).^pwr );
 
-    % -- 2b) separation band penalty on normalized distance --
-    % Config (with backward-compatible fallbacks)
-    SepLB   = getfield(opt, 'SepLB',   getfield(opt,'DnnLB',0.05)); %#ok<GFLD>
-    SepUB   = getfield(opt, 'SepUB',   getfield(opt,'DnnUB',1.3));  %#ok<GFLD>
-    SepMode = getfield(opt, 'SepMode', 'nn');                        % 'nn' or 'all'
-    WSep    = getfield(opt, 'WSep',    getfield(opt,'WNNProp',1e3)); %#ok<GFLD>
-    SizeAwareSep = getfield(opt, 'SizeAwareSep', false);             % if true, uses radii
+    % ---- separation band options (safe defaults without getfield) ----
+    if isfield(opt,'SepLB') && ~isempty(opt.SepLB)
+        SepLB = opt.SepLB;
+    elseif isfield(opt,'DnnLB') && ~isempty(opt.DnnLB)
+        SepLB = opt.DnnLB;
+    else
+        SepLB = 0.05;
+    end
 
-    % Pairwise center distances
+    if isfield(opt,'SepUB') && ~isempty(opt.SepUB)
+        SepUB = opt.SepUB;
+    elseif isfield(opt,'DnnUB') && ~isempty(opt.DnnUB)
+        SepUB = opt.DnnUB;
+    else
+        SepUB = 1.3;
+    end
+
+    if isfield(opt,'SepMode') && ~isempty(opt.SepMode)
+        SepMode = opt.SepMode;           % 'nn' or 'all'
+    else
+        SepMode = 'nn';
+    end
+
+    if isfield(opt,'WSep') && ~isempty(opt.WSep)
+        WSep = opt.WSep;
+    elseif isfield(opt,'WNNProp') && ~isempty(opt.WNNProp)
+        WSep = opt.WNNProp;
+    else
+        WSep = 1e3;
+    end
+
+    if isfield(opt,'SizeAwareSep') && ~isempty(opt.SizeAwareSep)
+        SizeAwareSep = logical(opt.SizeAwareSep);
+    else
+        SizeAwareSep = false;
+    end
+
+    % ---- separation penalty on normalized distance ----
     DX   = C0(:,1) - C0(:,1).';
     DY   = C0(:,2) - C0(:,2).';
     Dmat = hypot(DX,DY);
     Dmat(1:N+1:end) = inf;  % ignore self
 
     if SizeAwareSep
-        % Effective clearance between ellipse *boundaries*
-        ri   = 0.5*(aa+bb);                  % N×1
-        rj   = 0.5*(aa'+bb');                % 1×N -> N×N by implicit expansion
-        Deff = Dmat - (ri + rj);             % N×N
+        % boundary-to-boundary clearance (approx) using equivalent radii
+        ri   = 0.5*(aa+bb);          % N×1
+        rj   = 0.5*(aa'+bb');        % 1×N -> broadcast
+        Deff = Dmat - (ri + rj);     % N×N
         Deff(1:N+1:end) = inf;
+
         if strcmpi(SepMode,'nn')
-            d_use = min(Deff,[],2) / L0;     % N×1
+            d_use = min(Deff,[],2) / L0;      % N×1 nearest clearance
         else
             d_use = Deff(triu(true(N),1)) / L0;  % all unique pairs
         end
     else
-        % Center-to-center spacing only (dataset-normalized band)
+        % center-to-center spacing only
         if strcmpi(SepMode,'nn')
-            d_use = min(Dmat,[],2) / L0;         % N×1
+            d_use = min(Dmat,[],2) / L0;          % N×1
         else
-            d_use = Dmat(triu(true(N),1)) / L0;  % all unique pairs
+            d_use = Dmat(triu(true(N),1)) / L0;   % all unique pairs
         end
     end
 
     penSep = sum( max(0, SepLB - d_use).^pwr + max(0, d_use - SepUB).^pwr );
 
-    % Combine penalties
+    % ---- combine penalties ----
     pen = opt.WSizeProp*penBnd + WSep*penSep;
 
     % ===== 3) penalized objective =====
