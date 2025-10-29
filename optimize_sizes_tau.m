@@ -42,7 +42,10 @@ p.addParameter('SwarmSize', 30);
 p.addParameter('MaxIters', 30);
 p.addParameter('PenaltyW', 1e3);
 p.addParameter('BndMargin', 0.04);
-p.addParameter('SepMargin',  4.0);   % kept for API parity; not used below
+p.addParameter('SepLB', 0.05);      % lower bound on normalized separation
+p.addParameter('SepUB', 1.30);       % upper bound on normalized separation
+p.addParameter('SepMode','nn');      % 'nn' (nearest-neighbor) or 'all' (all-pairs)
+p.addParameter('WSep', 1e3);         % weight for separation band penalty
 p.addParameter('PropALB', 0.02);
 p.addParameter('PropAUB', 0.11);
 p.addParameter('PropBLB', 0.02);
@@ -183,39 +186,70 @@ end
 
 % ============================ objective =========================
 function f = wrapper(psx)
+    % ===== unpack PSO vector =====
     v   = reshape(psx,[],1);
     aa  = v(1:N);
     bb  = v(N+1:2*N);
     pph = v(2*N+1:3*N);
 
-    % robustness clamps (hard bounds already enforced by PSO)
+    % ===== robustness clamps (PSO already bounds, but be safe) =====
     aa = max(aa, 1e-9);
     bb = max(bb, 1e-9);
 
-    % 1) physics
+    % ===== 1) physics =====
     tau_raw = eval_tau(aa, bb, pph);
 
-    % 2) penalties (only NN band + boundary clearance)
-    % NN band: d_nn / L0 within [DnnLB, DnnUB]
-    DX = C0(:,1) - C0(:,1).';  DY = C0(:,2) - C0(:,2).';
-    Dmat = hypot(DX,DY); Dmat(1:N+1:end) = inf;
-    dnn  = min(Dmat,[],2);
-    dnn_prop = dnn / L0;
-
+    % ===== 2) penalties =====
     pwr = max(1, opt.PropPNorm);
-    penNN = sum( max(0, opt.DnnLB - dnn_prop).^pwr + max(0, dnn_prop - opt.DnnUB).^pwr );
 
-    % boundary clearance: (max(a,b) + margin) must be <= center clearance
+    % -- 2a) boundary clearance: (max(a,b)+margin) <= center-clearance --
     clr_center = local_clearance_to_polygon(C0, CH.polyX, CH.polyY);  % N×1
     need_gap   = max(aa, bb) + opt.BndMargin;
     penBnd     = sum( max(0, (need_gap - clr_center)/L0 ).^pwr );
 
-    pen = opt.WNNProp*penNN + opt.WSizeProp*penBnd;
+    % -- 2b) separation band penalty on normalized distance --
+    % Config (with backward-compatible fallbacks)
+    SepLB   = getfield(opt, 'SepLB',   getfield(opt,'DnnLB',0.05)); %#ok<GFLD>
+    SepUB   = getfield(opt, 'SepUB',   getfield(opt,'DnnUB',1.3));  %#ok<GFLD>
+    SepMode = getfield(opt, 'SepMode', 'nn');                        % 'nn' or 'all'
+    WSep    = getfield(opt, 'WSep',    getfield(opt,'WNNProp',1e3)); %#ok<GFLD>
+    SizeAwareSep = getfield(opt, 'SizeAwareSep', false);             % if true, uses radii
 
-    % 3) penalized objective
+    % Pairwise center distances
+    DX   = C0(:,1) - C0(:,1).';
+    DY   = C0(:,2) - C0(:,2).';
+    Dmat = hypot(DX,DY);
+    Dmat(1:N+1:end) = inf;  % ignore self
+
+    if SizeAwareSep
+        % Effective clearance between ellipse *boundaries*
+        ri   = 0.5*(aa+bb);                  % N×1
+        rj   = 0.5*(aa'+bb');                % 1×N -> N×N by implicit expansion
+        Deff = Dmat - (ri + rj);             % N×N
+        Deff(1:N+1:end) = inf;
+        if strcmpi(SepMode,'nn')
+            d_use = min(Deff,[],2) / L0;     % N×1
+        else
+            d_use = Deff(triu(true(N),1)) / L0;  % all unique pairs
+        end
+    else
+        % Center-to-center spacing only (dataset-normalized band)
+        if strcmpi(SepMode,'nn')
+            d_use = min(Dmat,[],2) / L0;         % N×1
+        else
+            d_use = Dmat(triu(true(N),1)) / L0;  % all unique pairs
+        end
+    end
+
+    penSep = sum( max(0, SepLB - d_use).^pwr + max(0, d_use - SepUB).^pwr );
+
+    % Combine penalties
+    pen = opt.WSizeProp*penBnd + WSep*penSep;
+
+    % ===== 3) penalized objective =====
     f = tau_raw + Wpen*pen;
 
-    % 4) bookkeeping
+    % ===== 4) bookkeeping =====
     iter_counter = iter_counter + 1;
     if f < tau_best
         tau_best = f;
@@ -229,7 +263,7 @@ function f = wrapper(psx)
 
     write_progress(k, tau_best, a_best, b_best, phi_best);
 
-    % optional plot
+    % ===== optional plot =====
     if opt.Plot && mod(k,10)==0
         clf; hold on; axis equal;
         plot([CH.polyX CH.polyX(1)], [CH.polyY CH.polyY(1)], 'k-', 'LineWidth', 1.1);
